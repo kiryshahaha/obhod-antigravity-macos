@@ -17,11 +17,15 @@ import shutil
 import threading
 import subprocess
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import unquote
 
 GATE_HOSTS = {
     "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.googleapis.com",
+    "generativelanguage.googleapis.com",
+    "cloudaicompanion.googleapis.com",
+    "aiplatform.googleapis.com",
+    "jetski-webchannel.googleapis.com",
 }
 PROBE_HOST = "daily-cloudcode-pa.googleapis.com"
 DEFAULT_LOCAL_PORT = 53129
@@ -44,6 +48,7 @@ PID_FILE = CONFIG_DIR / "proxy.pid"
 PORT_FILE = CONFIG_DIR / "proxy_port"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 LOG_FILE = CONFIG_DIR / "mac_unlocker.log"
+LAST_ACTIVITY_FILE = CONFIG_DIR / "last_activity.txt"
 
 
 def log(msg: str):
@@ -55,6 +60,23 @@ def log(msg: str):
             f.write(line + "\n")
     except Exception:
         pass
+
+
+def record_activity(msg: str):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        LAST_ACTIVITY_FILE.write_text(f"[{time.strftime('%H:%M:%S')}] {msg}", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def get_last_activity() -> str:
+    if LAST_ACTIVITY_FILE.is_file():
+        try:
+            return LAST_ACTIVITY_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return ""
 
 
 class UpstreamProxy:
@@ -88,7 +110,6 @@ class UpstreamProxy:
         if not raw:
             raise ValueError("Пустая строка")
 
-        # Удаляем протоколы
         rest = raw
         if rest.startswith("http://"):
             rest = rest[len("http://") :]
@@ -98,13 +119,11 @@ class UpstreamProxy:
         if "://" in rest:
             raise ValueError("Поддерживается только HTTP-прокси (http://...)")
 
-        # Разделение по последнему '@' на случай наличия '@' в пароле
         if "@" in rest:
             auth_part, hostport_part = rest.rsplit("@", 1)
             if ":" not in auth_part:
                 raise ValueError("Логин без пароля — формат: логин:пароль@хост:порт")
             user, password = auth_part.split(":", 1)
-            # URL decoding если были %XX
             user = unquote(user)
             password = unquote(password)
         else:
@@ -156,26 +175,26 @@ def clear_upstream():
             pass
 
 
+def is_gate_host(host: str) -> bool:
+    h = host.strip("[]").rstrip(".").lower()
+    if h in GATE_HOSTS:
+        return True
+    if h.endswith(".googleapis.com") and not h.startswith("storage."):
+        return True
+    return False
+
+
 def probe_upstream(up: UpstreamProxy, timeout: float = 8.0) -> tuple[bool, str]:
-    """
-    Проверяет работу HTTP-прокси:
-    1. Устанавливает TCP соединение с прокси
-    2. Отправляет CONNECT запрос к daily-cloudcode-pa.googleapis.com:443
-    3. Выполняет TLS рукопожатие с Google
-    4. Отправляет проверочный GET запрос
-    """
     try:
         sock = socket.create_connection((up.host, up.port), timeout=timeout)
         sock.settimeout(timeout)
 
-        # 1. CONNECT запрос
         req = f"CONNECT {PROBE_HOST}:443 HTTP/1.1\r\nHost: {PROBE_HOST}:443\r\n"
         if up.auth_header:
             req += f"Proxy-Authorization: {up.auth_header}\r\n"
         req += "\r\n"
         sock.sendall(req.encode("ascii"))
 
-        # Читаем HTTP статус
         response = b""
         while b"\r\n\r\n" not in response:
             chunk = sock.recv(1024)
@@ -193,12 +212,10 @@ def probe_upstream(up: UpstreamProxy, timeout: float = 8.0) -> tuple[bool, str]:
                 return False, "Ошибка 403: Прокси запрещает подключение к Google"
             return False, f"Прокси отклонил запрос: {status_line}"
 
-        # 2. TLS рукопожатие внутри туннеля
         ctx = ssl.create_default_context()
         tls_sock = ctx.wrap_socket(sock, server_hostname=PROBE_HOST)
         tls_sock.settimeout(timeout)
 
-        # 3. HTTP GET к бэкенду Google
         tls_req = (
             f"GET /v1internal:probe HTTP/1.1\r\n"
             f"Host: {PROBE_HOST}\r\n"
@@ -210,7 +227,7 @@ def probe_upstream(up: UpstreamProxy, timeout: float = 8.0) -> tuple[bool, str]:
         tls_sock.close()
 
         if res:
-            return True, f"Прокси успешно отвечает! Бэкенд Google доступен ({status_line.strip()})"
+            return True, f"Прокси отвечает! Доступ к Google подтверждён ({status_line.strip()})"
         return True, "CONNECT успешен, TLS соединение с Google установлено"
     except socket.timeout:
         return False, "Таймаут соединения с прокси"
@@ -230,7 +247,6 @@ class LocalProxyServer:
         self.thread = None
 
     def start(self, background: bool = True) -> bool:
-        # Пробуем bind к дефолтному или запасному порту
         candidate_ports = [self.port] + [p for p in FALLBACK_PORTS if p != self.port]
         bound = False
         for p in candidate_ports:
@@ -238,7 +254,7 @@ class LocalProxyServer:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind(("127.0.0.1", p))
-                s.listen(64)
+                s.listen(128)
                 self.server_sock = s
                 self.port = p
                 bound = True
@@ -309,7 +325,6 @@ class LocalProxyServer:
             parts = first_line.split()
 
             if len(parts) < 2 or parts[0].upper() != "CONNECT":
-                # Не CONNECT
                 client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
                 client.close()
                 return
@@ -322,24 +337,22 @@ class LocalProxyServer:
                 host = target
                 port = 443
 
-            host_clean = host.strip("[]").rstrip(".").lower()
-            is_gate = (port == 443 and host_clean in GATE_HOSTS)
-
+            is_gate = (port == 443 and is_gate_host(host))
             up = load_upstream()
 
             if is_gate and up is not None:
-                # Маршрутизируем через свой HTTP-прокси
+                log(f"CONNECT {host}:{port} -> уходит через upstream прокси {up.display()}")
+                record_activity(f"{host}:{port} -> через прокси {up.display()}")
                 remote_sock = self._connect_upstream(up, host, port)
                 if remote_sock is None:
-                    # Фоллбек на прямой туннель, если прокси не ответил
+                    log(f"CONNECT {host}:{port} -> прокси не ответил, фоллбек на прямое соединение")
                     remote_sock = socket.create_connection((host, port), timeout=8.0)
             else:
-                # Прямое соединение для всех остальных хостов
+                log(f"CONNECT {host}:{port} -> прямое соединение (не gate host)")
+                record_activity(f"{host}:{port} -> напрямую")
                 remote_sock = socket.create_connection((host, port), timeout=8.0)
 
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-
-            # Двунаправленный сплайсинг
             self._splice(client, remote_sock)
         except Exception as e:
             try:
@@ -407,7 +420,6 @@ class LocalProxyServer:
 
 
 def is_proxy_daemon_running() -> tuple[bool, int, int]:
-    """Возвращает (is_running, pid, port)"""
     if not PID_FILE.is_file():
         return False, 0, DEFAULT_LOCAL_PORT
 
@@ -415,14 +427,12 @@ def is_proxy_daemon_running() -> tuple[bool, int, int]:
         pid = int(PID_FILE.read_text().strip())
         port = int(PORT_FILE.read_text().strip()) if PORT_FILE.is_file() else DEFAULT_LOCAL_PORT
 
-        # Проверка жив ли процесс
         try:
             os.kill(pid, 0)
         except OSError:
             PID_FILE.unlink(missing_ok=True)
             return False, 0, port
 
-        # Проверка отвечает ли сокет
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                 return True, pid, port
@@ -455,7 +465,6 @@ def find_mac_antigravity_installs() -> list[Path]:
         Path("/Applications/Antigravity IDE.app"),
         Path.home() / "Applications" / "Antigravity IDE.app",
     ]
-    # Добавляем пути если установлены только CLI
     cli_dirs = [
         Path.home() / ".gemini" / "bin",
         Path.home() / ".local" / "bin",
@@ -471,14 +480,11 @@ def find_mac_antigravity_installs() -> list[Path]:
 def get_binary_targets(install_root: Path) -> list[Path]:
     targets = []
     if install_root.is_dir() and install_root.suffix == ".app":
-        # Это macOS App Bundle
         res_dir = install_root / "Contents" / "Resources"
         ext_bin = res_dir / "app" / "extensions" / "antigravity" / "bin"
         bin_dir = res_dir / "bin"
-        macos_dir = install_root / "Contents" / "MacOS"
 
-        # Ищем все language_server* и agy
-        for d in [ext_bin, bin_dir, macos_dir]:
+        for d in [ext_bin, bin_dir]:
             if d.is_dir():
                 for item in d.iterdir():
                     if item.is_file() and not item.name.endswith(".ag_backup"):
@@ -486,12 +492,10 @@ def get_binary_targets(install_root: Path) -> list[Path]:
                         if name.startswith("language_server") or name == "agy":
                             targets.append(item)
 
-        # Проверяем ~/.gemini/bin/agy если IDE использует внешний CLI
         gemini_bin = Path.home() / ".gemini" / "bin" / "agy"
         if gemini_bin.is_file() and gemini_bin not in targets:
             targets.append(gemini_bin)
     else:
-        # Прямой путь к директории или бинарнику
         if install_root.is_file():
             targets.append(install_root)
         elif install_root.is_dir():
@@ -500,15 +504,32 @@ def get_binary_targets(install_root: Path) -> list[Path]:
                     if item.name.startswith("language_server") or item.name == "agy":
                         targets.append(item)
 
-    return targets
+    # Дедупликация с сохранением порядка
+    unique = []
+    seen = set()
+    for t in targets:
+        try:
+            r = t.resolve()
+        except Exception:
+            r = t
+        if r not in seen:
+            seen.add(r)
+            unique.append(t)
+    return unique
 
 
 def inspect_binary(bin_path: Path) -> dict:
+    name_lower = bin_path.name.lower()
+    is_ls = "language_server" in name_lower
+
     res = {
         "path": bin_path,
+        "name": bin_path.name,
+        "is_ls": is_ls,
         "patched_eligibility": False,
         "patched_proxy_var": False,
         "can_patch": False,
+        "is_done": False,
         "has_backup": bin_path.with_name(bin_path.name + ".ag_backup").is_file(),
     }
     try:
@@ -520,6 +541,13 @@ def inspect_binary(bin_path: Path) -> dict:
 
         if PATCH_PROXY_NEW in data:
             res["patched_proxy_var"] = True
+
+        if is_ls:
+            # Для language_server критичен патч ineligible
+            res["is_done"] = res["patched_eligibility"]
+        else:
+            # Для agy сигнатуры ineligible нет в оригинале, смотрим proxy_var или отсутствие старых сигнатур
+            res["is_done"] = res["patched_proxy_var"] or (PATCH_INELIGIBLE_OLD not in data)
     except Exception:
         pass
     return res
@@ -565,17 +593,15 @@ def patch_binary_file(bin_path: Path) -> tuple[bool, str]:
             count_proxy += 1
             idx += len(PATCH_PROXY_NEW)
 
-        # Атомарная запись
         tmp_path = bin_path.with_name(bin_path.name + ".tmp")
         tmp_path.write_bytes(data)
         os.chmod(tmp_path, os.stat(bin_path).st_mode)
         tmp_path.replace(bin_path)
 
-        # На macOS критично: переподписываем бинарник через ad-hoc codesign,
-        # иначе система убьёт изменённый бинарник (Code Signature Invalid)!
+        # Ad-hoc codesign на macOS
         re_sign_macho(bin_path)
 
-        return True, f"Заменено: eligibility: {count_ineligible}, proxy_var: {count_proxy}"
+        return True, f"ineligible: {count_ineligible}, proxy_var: {count_proxy}"
     except Exception as e:
         return False, str(e)
 
@@ -590,7 +616,6 @@ def unpatch_binary_file(bin_path: Path) -> tuple[bool, str]:
         except Exception as e:
             return False, f"Ошибка восстановления: {e}"
 
-    # Если бэкапа нет, делаем обратную замену
     try:
         data = bytearray(bin_path.read_bytes())
         data = data.replace(PATCH_INELIGIBLE_NEW, PATCH_INELIGIBLE_OLD)
@@ -608,7 +633,6 @@ def unpatch_binary_file(bin_path: Path) -> tuple[bool, str]:
 
 
 def re_sign_macho(bin_path: Path):
-    """Выполняет codesign --force --deep -s - для работы на macOS"""
     if sys.platform != "darwin":
         return
     try:
@@ -623,54 +647,128 @@ def re_sign_macho(bin_path: Path):
 
 
 def kill_antigravity_processes():
-    """Завершает фоновые процессы language_server и agy перед патчем"""
-    patterns = ["language_server", "agy", "Antigravity"]
-    for pat in patterns:
+    """Завершает все процессы Antigravity и языкового сервера перед патчем"""
+    cmds = [
+        ["killall", "-9", "Antigravity"],
+        ["killall", "-9", "Antigravity IDE"],
+        ["killall", "-9", "language_server"],
+        ["killall", "-9", "language_server_darwin_arm64"],
+        ["killall", "-9", "language_server_darwin_x64"],
+        ["killall", "-9", "agy"],
+        ["pkill", "-9", "-i", "-f", "language_server"],
+        ["pkill", "-9", "-i", "-f", "antigravity"],
+        ["pkill", "-9", "-i", "-f", "agy"],
+    ]
+    for cmd in cmds:
         try:
-            subprocess.run(["pkill", "-f", pat], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         except Exception:
             pass
-    time.sleep(0.5)
+    time.sleep(1.0)
 
 
 # ---------------------------------------------------------------------------
-# Настройка системного окружения на macOS
+# Настройка системного окружения и settings.json Antigravity на macOS
 # ---------------------------------------------------------------------------
+
+def get_antigravity_settings_paths() -> list[Path]:
+    candidates = [
+        Path.home() / "Library" / "Application Support" / "Antigravity" / "User" / "settings.json",
+        Path.home() / "Library" / "Application Support" / "Antigravity IDE" / "User" / "settings.json",
+        Path.home() / "Library" / "Application Support" / "antigravity" / "User" / "settings.json",
+        Path.home() / ".config" / "Antigravity" / "User" / "settings.json",
+        Path.home() / ".config" / "antigravity" / "User" / "settings.json",
+    ]
+    app_support = Path.home() / "Library" / "Application Support"
+    if app_support.is_dir():
+        for d in app_support.iterdir():
+            if d.is_dir() and "antigravity" in d.name.lower():
+                p = d / "User" / "settings.json"
+                if p not in candidates:
+                    candidates.append(p)
+    return candidates
+
+
+def configure_antigravity_settings(port: int = DEFAULT_LOCAL_PORT):
+    proxy_url = f"http://127.0.0.1:{port}"
+    for p in get_antigravity_settings_paths():
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            data = {}
+            if p.is_file():
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    lines = p.read_text(encoding="utf-8").splitlines()
+                    clean_lines = [l for l in lines if not l.strip().startswith("//")]
+                    try:
+                        data = json.loads("\n".join(clean_lines))
+                    except Exception:
+                        data = {}
+            data["http.proxy"] = proxy_url
+            data["http.proxySupport"] = "override"
+            p.write_text(json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8")
+            log(f"Прокси прописан в {p}")
+        except Exception as e:
+            log(f"Ошибка настройки settings.json ({p}): {e}")
+
+
+def remove_antigravity_settings():
+    for p in get_antigravity_settings_paths():
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                data.pop("http.proxy", None)
+                data.pop("http.proxySupport", None)
+                p.write_text(json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8")
+                log(f"Прокси удалён из {p}")
+            except Exception:
+                pass
+
 
 def apply_mac_environment(port: int = DEFAULT_LOCAL_PORT):
     proxy_url = f"http://127.0.0.1:{port}"
-    # 1. launchctl setenv — для GUI программ macOS, запускаемых из Finder/Dock
+
+    # 1. Записываем в settings.json самого Antigravity (гарантирует подхват при любом способе запуска)
+    configure_antigravity_settings(port)
+
+    # 2. launchctl setenv — для GUI программ macOS
     if sys.platform == "darwin":
         try:
             subprocess.run(["launchctl", "setenv", PROXY_VAR_NAME, proxy_url], check=False)
+            subprocess.run(["launchctl", "setenv", "HTTPS_PROXY", proxy_url], check=False)
         except Exception:
             pass
 
-    # 2. Добавляем в ~/.zshrc (дефолтный шелл macOS)
+    # 3. Добавляем в ~/.zshrc (дефолтный шелл macOS)
     zshrc = Path.home() / ".zshrc"
     marker_start = "# >>> Antigravity Unlocker >>>"
     marker_end = "# <<< Antigravity Unlocker <<<"
-    line = f'export {PROXY_VAR_NAME}="{proxy_url}"'
+    lines = [
+        f'export {PROXY_VAR_NAME}="{proxy_url}"',
+        f'export HTTPS_PROXY="{proxy_url}"',
+    ]
 
     content = ""
     if zshrc.is_file():
         content = zshrc.read_text(encoding="utf-8")
 
-    # Удаляем старую запись если была
     if marker_start in content and marker_end in content:
         pattern = re.compile(rf"{re.escape(marker_start)}.*?{re.escape(marker_end)}\n?", re.DOTALL)
         content = pattern.sub("", content)
 
-    # Добавляем новую
-    block = f"{marker_start}\n{line}\n{marker_end}\n"
+    block = f"{marker_start}\n" + "\n".join(lines) + f"\n{marker_end}\n"
     content = content.rstrip() + "\n" + block
     zshrc.write_text(content, encoding="utf-8")
 
 
 def remove_mac_environment():
+    remove_antigravity_settings()
+
     if sys.platform == "darwin":
         try:
             subprocess.run(["launchctl", "unsetenv", PROXY_VAR_NAME], check=False)
+            subprocess.run(["launchctl", "unsetenv", "HTTPS_PROXY"], check=False)
         except Exception:
             pass
 
@@ -684,6 +782,20 @@ def remove_mac_environment():
             pattern = re.compile(rf"{re.escape(marker_start)}.*?{re.escape(marker_end)}\n?", re.DOTALL)
             content = pattern.sub("", content)
             zshrc.write_text(content, encoding="utf-8")
+
+
+def launch_antigravity_app(port: int = DEFAULT_LOCAL_PORT):
+    proxy_url = f"http://127.0.0.1:{port}"
+    env = os.environ.copy()
+    env[PROXY_VAR_NAME] = proxy_url
+    env["HTTPS_PROXY"] = proxy_url
+    env["http_proxy"] = proxy_url
+    env["https_proxy"] = proxy_url
+    try:
+        subprocess.run(["open", "-a", "Antigravity"], env=env, check=False)
+        return True, "Antigravity запущен с настроенным прокси!"
+    except Exception as e:
+        return False, f"Ошибка запуска Antigravity: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -723,46 +835,68 @@ class UnlockerTUI:
         running, pid, port = is_proxy_daemon_running()
         installs = find_mac_antigravity_installs()
 
-        # Статус прокси
         if up:
             proxy_str = f"{Colors.GREEN}Подключён:{Colors.RESET} {up.display()}"
         else:
             proxy_str = f"{Colors.YELLOW}Не настроен{Colors.RESET} (нажмите 1 для ввода ссылки)"
 
-        # Статус службы
         if running:
             service_str = f"{Colors.GREEN}Работает{Colors.RESET} (PID: {pid}, порт 127.0.0.1:{port})"
         else:
             service_str = f"{Colors.RED}Остановлен{Colors.RESET}"
 
-        # Статус патча бинарников
         all_targets = []
         for inst in installs:
             all_targets.extend(get_binary_targets(inst))
 
-        patched_count = 0
+        done_count = 0
+        file_details = []
         for t in all_targets:
             info = inspect_binary(t)
-            if info["patched_eligibility"]:
-                patched_count += 1
+            if info["is_done"]:
+                done_count += 1
+                status_icon = f"{Colors.GREEN}✓{Colors.RESET}"
+            else:
+                status_icon = f"{Colors.YELLOW}✗{Colors.RESET}"
+            file_details.append(f"{status_icon} {t.name}")
 
         if not all_targets:
             patch_str = f"{Colors.YELLOW}Установка Antigravity не найдена{Colors.RESET}"
-        elif patched_count == len(all_targets) and len(all_targets) > 0:
-            patch_str = f"{Colors.GREEN}Пропатчено{Colors.RESET} ({patched_count}/{len(all_targets)} файлов)"
-        elif patched_count > 0:
-            patch_str = f"{Colors.YELLOW}Частично пропатчено{Colors.RESET} ({patched_count}/{len(all_targets)})"
+        elif done_count == len(all_targets) and len(all_targets) > 0:
+            patch_str = f"{Colors.GREEN}Пропатчено полностью{Colors.RESET} ({done_count}/{len(all_targets)} файлов)"
         else:
-            patch_str = f"{Colors.RED}Не пропатчено{Colors.RESET} ({len(all_targets)} найдено)"
+            patch_str = f"{Colors.YELLOW}Частично ({done_count}/{len(all_targets)}){Colors.RESET}"
 
-        # Переменная окружения
+        # Статус настроек прокси
+        settings_configured = False
+        for p in get_antigravity_settings_paths():
+            if p.is_file():
+                try:
+                    c = p.read_text(encoding="utf-8")
+                    if "http.proxy" in c and str(port) in c:
+                        settings_configured = True
+                        break
+                except Exception:
+                    pass
+
         env_val = os.environ.get(PROXY_VAR_NAME)
-        env_str = f"{Colors.GREEN}Активна{Colors.RESET} ({env_val})" if env_val else f"{Colors.YELLOW}В .zshrc / launchctl{Colors.RESET}"
+        if settings_configured:
+            config_str = f"{Colors.GREEN}Настроен в settings.json + launchctl{Colors.RESET}"
+        elif env_val:
+            config_str = f"{Colors.GREEN}Активен в сессии ({env_val}){Colors.RESET}"
+        else:
+            config_str = f"{Colors.YELLOW}В .zshrc / launchctl{Colors.RESET}"
+
+        last_act = get_last_activity()
 
         print(f"  {Colors.BOLD}• Свой HTTP-прокси:{Colors.RESET}      {proxy_str}")
         print(f"  {Colors.BOLD}• Локальная служба:{Colors.RESET}      {service_str}")
         print(f"  {Colors.BOLD}• Патч клиента (400):{Colors.RESET}    {patch_str}")
-        print(f"  {Colors.BOLD}• Переменная {PROXY_VAR_NAME}:{Colors.RESET}  {env_str}")
+        if file_details:
+            print(f"    {Colors.GRAY}Компоненты: {', '.join(file_details)}{Colors.RESET}")
+        print(f"  {Colors.BOLD}• Конфигурация прокси:{Colors.RESET} {config_str}")
+        if last_act:
+            print(f"  {Colors.BOLD}• Трафик Antigravity:{Colors.RESET}  {Colors.CYAN}{last_act}{Colors.RESET}")
         print(f"{Colors.GRAY}────────────────────────────────────────────────────────────────────────{Colors.RESET}")
 
         if self.message:
@@ -777,14 +911,14 @@ class UnlockerTUI:
 
             print(f"  {Colors.BOLD}[1]{Colors.RESET} Ввести ссылку своего HTTP-прокси (например, http://user:pass@proxy.example.com:8080)")
             print(f"  {Colors.BOLD}[2]{Colors.RESET} Проверить работу прокси (тест связи с Google)")
-            print(f"  {Colors.BOLD}[3]{Colors.RESET} {Colors.GREEN}Включить всё{Colors.RESET} (Патч + Запуск прокси + Переменные)")
-            print(f"  {Colors.BOLD}[4]{Colors.RESET} {Colors.YELLOW}Выключить всё{Colors.RESET} (Откат патча + Остановка прокси + Сброс)")
-            print(f"  {Colors.BOLD}[5]{Colors.RESET} Запустить / Перезапустить локальный прокси")
-            print(f"  {Colors.BOLD}[6]{Colors.RESET} Остановить локальный прокси")
-            print(f"  {Colors.BOLD}[7]{Colors.RESET} Патчить Antigravity (с ad-hoc переподписью codesign)")
-            print(f"  {Colors.BOLD}[8]{Colors.RESET} Восстановить оригиналы Antigravity (откат)")
+            print(f"  {Colors.BOLD}[3]{Colors.RESET} {Colors.GREEN}Включить всё{Colors.RESET} (Патч + settings.json + Запуск службы)")
+            print(f"  {Colors.BOLD}[4]{Colors.RESET} {Colors.CYAN}Запустить Antigravity с прокси{Colors.RESET} (гарантированный обход 400)")
+            print(f"  {Colors.BOLD}[5]{Colors.RESET} {Colors.YELLOW}Выключить всё{Colors.RESET} (Откат патча + Остановка службы + Сброс)")
+            print(f"  {Colors.BOLD}[6]{Colors.RESET} Перезапустить локальную службу прокси")
+            print(f"  {Colors.BOLD}[7]{Colors.RESET} Остановить локальную службу прокси")
+            print(f"  {Colors.BOLD}[8]{Colors.RESET} Восстановить оригиналы бинарников (откат)")
             print(f"  {Colors.BOLD}[9]{Colors.RESET} Удалить сохранённый прокси")
-            print(f"  {Colors.BOLD}[0]{Colors.RESET} Выход (прокси продолжит работать в фоне)")
+            print(f"  {Colors.BOLD}[0]{Colors.RESET} Выход (служба продолжит работать в фоне)")
             print(f"\n{Colors.CYAN}Выберите действие (0-9):{Colors.RESET} ", end="", flush=True)
 
             try:
@@ -800,13 +934,13 @@ class UnlockerTUI:
             elif choice == "3":
                 self.action_enable_all()
             elif choice == "4":
-                self.action_disable_all()
+                self.action_launch_app()
             elif choice == "5":
-                self.action_start_proxy()
+                self.action_disable_all()
             elif choice == "6":
-                self.action_stop_proxy()
+                self.action_start_proxy()
             elif choice == "7":
-                self.action_patch_all()
+                self.action_stop_proxy()
             elif choice == "8":
                 self.action_unpatch_all()
             elif choice == "9":
@@ -870,7 +1004,6 @@ class UnlockerTUI:
         stop_proxy_daemon()
         port = DEFAULT_LOCAL_PORT
 
-        # Запускаем отдельный фоновый процесс
         script_path = Path(__file__).resolve()
         proc = subprocess.Popen(
             [sys.executable, str(script_path), "--daemon"],
@@ -883,7 +1016,7 @@ class UnlockerTUI:
         running, pid, bound_port = is_proxy_daemon_running()
         if running:
             apply_mac_environment(bound_port)
-            self.message = f"Локальный прокси запущен (PID {pid}) на 127.0.0.1:{bound_port}"
+            self.message = f"Локальная служба запущена (PID {pid}) на 127.0.0.1:{bound_port}"
             self.message_color = Colors.GREEN
         else:
             self.message = "Не удалось запустить службу локального прокси"
@@ -913,7 +1046,7 @@ class UnlockerTUI:
             if ok:
                 success += 1
 
-        self.message = f"Пропатчено {success} из {len(targets)} бинарников Antigravity"
+        self.message = f"Пропатчено {success} из {len(targets)} файлов Antigravity"
         self.message_color = Colors.GREEN if success > 0 else Colors.RED
 
     def action_unpatch_all(self):
@@ -941,24 +1074,38 @@ class UnlockerTUI:
             if not up:
                 return
 
-        # 1. Патчим бинарники
+        # 1. Завершаем старые запущенные процессы Antigravity
+        kill_antigravity_processes()
+
+        # 2. Патчим бинарники
         self.action_patch_all()
 
-        # 2. Запускаем прокси
+        # 3. Запускаем службу прокси
         self.action_start_proxy()
 
-        # 3. Применяем переменные
+        # 4. Прописываем прокси в settings.json и launchctl
         _, _, port = is_proxy_daemon_running()
         apply_mac_environment(port)
 
-        self.message = "«Включить всё» выполнено! Перезапустите Antigravity."
+        self.message = "«Включить всё» выполнено! Настройки прописаны в settings.json. Запустите Antigravity (пункт 4)."
         self.message_color = Colors.GREEN
+
+    def action_launch_app(self):
+        running, _, port = is_proxy_daemon_running()
+        if not running:
+            self.action_start_proxy()
+            _, _, port = is_proxy_daemon_running()
+
+        kill_antigravity_processes()
+        ok, msg = launch_antigravity_app(port)
+        self.message = msg
+        self.message_color = Colors.GREEN if ok else Colors.RED
 
     def action_disable_all(self):
         self.action_stop_proxy()
         remove_mac_environment()
         self.action_unpatch_all()
-        self.message = "Все компоненты обхода отключены, файлы восстановлены."
+        self.message = "Все компоненты обхода отключены, настройки сброшены."
         self.message_color = Colors.YELLOW
 
 
@@ -975,7 +1122,6 @@ def main():
             pass
 
     if "--daemon" in sys.argv:
-        # Режим фонового демона прокси
         server = LocalProxyServer()
         server.start(background=False)
         return
@@ -1010,7 +1156,6 @@ def main():
                 print(f"Unpatch {t.name}: {msg}")
         return
 
-    # По умолчанию запускаем TUI
     tui = UnlockerTUI()
     tui.run()
 
