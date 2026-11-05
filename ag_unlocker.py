@@ -42,6 +42,15 @@ PATCH_TIERS_NEW = b"inexigible_tiers"
 PATCH_PROXY_OLD = b"https_proxy"
 PATCH_PROXY_NEW = b"AG_LS_PROXY"
 
+# Сигнатуры для разблокировки входа в Google-аккаунт из-под санкций (JS-патчи)
+RE_IDE_AUTH = re.compile(
+    r'async\s+([A-Za-z_$0-9]+)\(([A-Za-z_$0-9]+)\)\s*\{\s*if\(this\.([A-Za-z_$0-9]+)\.send\(\{type:[A-Za-z_$0-9]+\.isGcpTos\?"GCP_SIGN_IN":"SIGN_IN"\}\),this\.([A-Za-z_$0-9]+)\.resetIsTierGCPTos\(\),this\.[A-Za-z_$0-9]+\.isGoogleInternal\)\{try\{await this\.([A-Za-z_$0-9]+)\.loadCodeAssist\([A-Za-z_$0-9]+\);const\{settings:([A-Za-z_$0-9]+),userTier:([A-Za-z_$0-9]+)\}=await this\.refreshUserStatus\([A-Za-z_$0-9]+\),([A-Za-z_$0-9]+)=([A-Za-z_$0-9]+)\([A-Za-z_$0-9]+\);this\.([A-Za-z_$0-9]+)\.pushUpdate\([A-Za-z_$0-9]+\),this\.[A-Za-z_$0-9]+\.send\(\{type:"AUTH_SUCCESS",tokenInfo:[A-Za-z_$0-9]+\}\),this\.([A-Za-z_$0-9]+)\.fire\(\{settings:[A-Za-z_$0-9]+,userTier:[A-Za-z_$0-9]+\}\)\}catch\(([A-Za-z_$0-9]+)\)\{.*?(?:return\}|return;\s*\})'
+)
+
+RE_EXT_STATUS = re.compile(
+    r'const t=await ([A-Za-z_$][A-Za-z_$0-9.]*)\.UserStatus\.getUserStatus\(\);if\(!t\)return\[\];const n=\(0,([A-Za-z_$][A-Za-z_$0-9.]*)\)\(t,([A-Za-z_$][A-Za-z_$0-9.]*)\),\{email:([A-Za-z_$][A-Za-z_$0-9]*),name:([A-Za-z_$][A-Za-z_$0-9]*)\}=n;return""===([A-Za-z_$][A-Za-z_$0-9]*)\?\[\]:'
+)
+
 CONFIG_DIR = Path.home() / ".local" / "share" / "agunlocker"
 UPSTREAM_FILE = CONFIG_DIR / "upstream.txt"
 PID_FILE = CONFIG_DIR / "proxy.pid"
@@ -668,6 +677,202 @@ def kill_antigravity_processes():
 
 
 # ---------------------------------------------------------------------------
+# Разблокировка входа в аккаунт из-под санкций (JS-патчи)
+# ---------------------------------------------------------------------------
+
+def get_js_targets(install_root: Path) -> list[Path]:
+    targets = []
+    if install_root.is_dir() and install_root.suffix == ".app":
+        res_dir = install_root / "Contents" / "Resources"
+        app_dir = res_dir / "app"
+
+        ide_main = app_dir / "out" / "main.js"
+        ext_main = app_dir / "extensions" / "antigravity" / "dist" / "extension.js"
+        desktop_main = app_dir / "dist" / "main.js"
+
+        for p in [ide_main, ext_main, desktop_main]:
+            if p.is_file() and not p.name.endswith(".ag_backup"):
+                targets.append(p)
+    return targets
+
+
+def inspect_js_file(js_path: Path) -> dict:
+    res = {
+        "path": js_path,
+        "name": js_path.name,
+        "patched": False,
+        "has_backup": js_path.with_name(js_path.name + ".ag_backup").is_file(),
+    }
+    try:
+        content = js_path.read_text(encoding="utf-8", errors="ignore")
+        if "// UNLOCKED" in content or "/*[AG_EXT_PATCHED]*/" in content or "/*[AG_IDE_PATCHED]*/" in content:
+            res["patched"] = True
+    except Exception:
+        pass
+    return res
+
+
+def patch_ide_main_js(main_js: Path) -> tuple[bool, str]:
+    try:
+        content = main_js.read_text(encoding="utf-8")
+        if "// UNLOCKED" in content or "/*[AG_IDE_PATCHED]*/" in content:
+            return True, "Уже пропатчен"
+
+        m = RE_IDE_AUTH.search(content)
+        if not m:
+            return False, "Сигнатура авторизации в main.js не найдена"
+
+        fname = m.group(1)
+        var_t = m.group(2)
+        var_t_send = m.group(3)
+        var_y = m.group(4)
+        var_i = m.group(8)
+        var_func = m.group(9)
+        var_f = m.group(10)
+        var_h = m.group(11)
+
+        payload = (
+            f"async {fname}({var_t}){{\n"
+            f"    this.{var_t_send}.send({{type:{var_t}.isGcpTos?\"GCP_SIGN_IN\":\"SIGN_IN\"}});\n"
+            f"    this.{var_y}.resetIsTierGCPTos();\n"
+            f"    try {{\n"
+            f"        try {{ await this.{var_y}.loadCodeAssist({var_t}); }} catch(_) {{}}\n"
+            f"        try {{ await this.{var_y}.onboardUser(\"standard-tier\", {var_t}); }} catch(_) {{\n"
+            f"            try {{ await this.{var_y}.onboardUser(\"free-tier\", {var_t}); }} catch(__) {{}}\n"
+            f"        }}\n"
+            f"        let __res = {{ settings: {{}}, userTier: {{ id: \"pro\", description: \"Pro\" }} }};\n"
+            f"        try {{ __res = await this.refreshUserStatus({var_t}); }} catch(_) {{}}\n"
+            f"        const {var_i} = {var_func}({var_t});\n"
+            f"        try {{ this.{var_f}.pushUpdate({var_i}); }} catch(_) {{}}\n"
+            f"        this.{var_t_send}.send({{type:\"AUTH_SUCCESS\",tokenInfo:{var_t}}});\n"
+            f"        this.{var_h}.fire({{settings:__res.settings, userTier:__res.userTier}});\n"
+            f"    }} catch(e) {{}}\n"
+            f"    return;\n"
+        )
+
+        backup_path = main_js.with_name(main_js.name + ".ag_backup")
+        if not backup_path.exists():
+            shutil.copy2(main_js, backup_path)
+
+        new_content = content[: m.start()] + payload + content[m.end() :] + "\n/*[AG_IDE_PATCHED]*/\n// UNLOCKED\n"
+
+        tmp_path = main_js.with_name(main_js.name + ".tmp")
+        tmp_path.write_text(new_content, encoding="utf-8")
+        os.chmod(tmp_path, os.stat(main_js).st_mode)
+        tmp_path.replace(main_js)
+        return True, "Патч авторизации main.js успешно применён"
+    except Exception as e:
+        return False, str(e)
+
+
+def patch_extension_js(ext_js: Path) -> tuple[bool, str]:
+    try:
+        content = ext_js.read_text(encoding="utf-8")
+        if "/*[AG_EXT_PATCHED]*/" in content:
+            return True, "Уже пропатчен"
+
+        m = RE_EXT_STATUS.search(content)
+        if not m:
+            return False, "Сигнатура UserStatus в extension.js не найдена"
+
+        ns = m.group(1)
+        p2 = m.group(2)
+        dz7 = m.group(3)
+        email = m.group(4)
+        name = m.group(5)
+
+        replacement = (
+            f"const t=await {ns}.UserStatus.getUserStatus();let {email}=\"\",{name}=\"\";"
+            f"try{{if(t){{const n=(0,{p2})(t,{dz7});{email}=n.email||\"\";{name}=n.name||\"\";}}}}catch(_){{}}"
+            f"if({email}===\"\"){{{email}=\"antigravity-user\";{name}=\"User\";}}return false?[]:"
+        )
+
+        backup_path = ext_js.with_name(ext_js.name + ".ag_backup")
+        if not backup_path.exists():
+            shutil.copy2(ext_js, backup_path)
+
+        new_content = "/*[AG_EXT_PATCHED]*/\n" + content[: m.start()] + replacement + content[m.end() :] + "\n// UNLOCKED\n"
+
+        tmp_path = ext_js.with_name(ext_js.name + ".tmp")
+        tmp_path.write_text(new_content, encoding="utf-8")
+        os.chmod(tmp_path, os.stat(ext_js).st_mode)
+        tmp_path.replace(ext_js)
+        return True, "Патч UserStatus extension.js успешно применён"
+    except Exception as e:
+        return False, str(e)
+
+
+def patch_desktop_main_js(desktop_js: Path) -> tuple[bool, str]:
+    try:
+        content = desktop_js.read_text(encoding="utf-8")
+        if "// UNLOCKED" in content:
+            return True, "Уже пропатчен"
+
+        new_content = re.sub(
+            r'_handleAuthErrorResponse\(([a-zA-Z_$]+)\)\{var ([a-zA-Z_$]+)=\1\?\.failureDetails;',
+            r'_handleAuthErrorResponse(\1){var \2=\1?.failureDetails; if(\2?.case==="ineligible"){ this._authActor.send({type:"AUTH_SUCCESS",tokenInfo:{accessToken:""},scopes:[],isGcpTos:false}); return; }',
+            content,
+        )
+        new_content = re.sub(
+            r'\?\.failureDetails\?\.case==="ineligible"\?this\._authActor\.send\(\{type:"SET_INELIGIBLE"',
+            r'?.failureDetails?.case==="NEVER_MATCH"?this._authActor.send({type:"SET_INELIGIBLE"',
+            new_content,
+        )
+
+        if new_content != content:
+            backup_path = desktop_js.with_name(desktop_js.name + ".ag_backup")
+            if not backup_path.exists():
+                shutil.copy2(desktop_js, backup_path)
+            tmp_path = desktop_js.with_name(desktop_js.name + ".tmp")
+            tmp_path.write_text(new_content + "\n// UNLOCKED\n", encoding="utf-8")
+            os.chmod(tmp_path, os.stat(desktop_js).st_mode)
+            tmp_path.replace(desktop_js)
+            return True, "Патч Desktop main.js применён"
+        return False, "Сигнатуры Desktop не найдены"
+    except Exception as e:
+        return False, str(e)
+
+
+def patch_account_auth_all(installs: list[Path] | None = None) -> list[tuple[str, bool, str]]:
+    results = []
+    if installs is None:
+        installs = find_mac_antigravity_installs()
+    for inst in installs:
+        targets = get_js_targets(inst)
+        for t in targets:
+            name = t.name
+            parent = t.parent.name
+            label = f"{parent}/{name}"
+            if name == "main.js" and parent == "out":
+                ok, msg = patch_ide_main_js(t)
+            elif name == "extension.js":
+                ok, msg = patch_extension_js(t)
+            elif name == "main.js" and parent == "dist":
+                ok, msg = patch_desktop_main_js(t)
+            else:
+                continue
+            results.append((label, ok, msg))
+    return results
+
+
+def unpatch_account_auth_all(installs: list[Path] | None = None) -> int:
+    count = 0
+    if installs is None:
+        installs = find_mac_antigravity_installs()
+    for inst in installs:
+        targets = get_js_targets(inst)
+        for t in targets:
+            backup_path = t.with_name(t.name + ".ag_backup")
+            if backup_path.is_file():
+                try:
+                    shutil.copy2(backup_path, t)
+                    count += 1
+                except Exception:
+                    pass
+    return count
+
+
+# ---------------------------------------------------------------------------
 # Настройка системного окружения и settings.json Antigravity на macOS
 # ---------------------------------------------------------------------------
 
@@ -867,6 +1072,25 @@ class UnlockerTUI:
         else:
             patch_str = f"{Colors.YELLOW}Частично ({done_count}/{len(all_targets)}){Colors.RESET}"
 
+        # Статус разблокировки входа в аккаунт из-под санкций
+        all_js = []
+        for inst in installs:
+            all_js.extend(get_js_targets(inst))
+
+        js_done = 0
+        for j in all_js:
+            if inspect_js_file(j)["patched"]:
+                js_done += 1
+
+        if not all_js:
+            account_str = f"{Colors.GRAY}Не требуется (v2.4+ / файлы не найдены){Colors.RESET}"
+        elif js_done == len(all_js) and len(all_js) > 0:
+            account_str = f"{Colors.GREEN}Разблокирован{Colors.RESET} ({js_done}/{len(all_js)} файлов)"
+        elif js_done > 0:
+            account_str = f"{Colors.YELLOW}Частично ({js_done}/{len(all_js)}){Colors.RESET}"
+        else:
+            account_str = f"{Colors.RED}Не разблокирован{Colors.RESET} ({len(all_js)} файлов найдено)"
+
         # Статус настроек прокси
         settings_configured = False
         for p in get_antigravity_settings_paths():
@@ -894,6 +1118,7 @@ class UnlockerTUI:
         print(f"  {Colors.BOLD}• Патч клиента (400):{Colors.RESET}    {patch_str}")
         if file_details:
             print(f"    {Colors.GRAY}Компоненты: {', '.join(file_details)}{Colors.RESET}")
+        print(f"  {Colors.BOLD}• Вход из-под санкций:{Colors.RESET}  {account_str}")
         print(f"  {Colors.BOLD}• Конфигурация прокси:{Colors.RESET} {config_str}")
         if last_act:
             print(f"  {Colors.BOLD}• Трафик Antigravity:{Colors.RESET}  {Colors.CYAN}{last_act}{Colors.RESET}")
@@ -911,15 +1136,16 @@ class UnlockerTUI:
 
             print(f"  {Colors.BOLD}[1]{Colors.RESET} Ввести ссылку своего HTTP-прокси (например, http://user:pass@proxy.example.com:8080)")
             print(f"  {Colors.BOLD}[2]{Colors.RESET} Проверить работу прокси (тест связи с Google)")
-            print(f"  {Colors.BOLD}[3]{Colors.RESET} {Colors.GREEN}Включить всё{Colors.RESET} (Патч + settings.json + Запуск службы)")
+            print(f"  {Colors.BOLD}[3]{Colors.RESET} {Colors.GREEN}Включить всё{Colors.RESET} (Патч 400 + Вход в аккаунт + settings.json + Запуск службы)")
             print(f"  {Colors.BOLD}[4]{Colors.RESET} {Colors.CYAN}Запустить Antigravity с прокси{Colors.RESET} (гарантированный обход 400)")
-            print(f"  {Colors.BOLD}[5]{Colors.RESET} {Colors.YELLOW}Выключить всё{Colors.RESET} (Откат патча + Остановка службы + Сброс)")
-            print(f"  {Colors.BOLD}[6]{Colors.RESET} Перезапустить локальную службу прокси")
-            print(f"  {Colors.BOLD}[7]{Colors.RESET} Остановить локальную службу прокси")
-            print(f"  {Colors.BOLD}[8]{Colors.RESET} Восстановить оригиналы бинарников (откат)")
-            print(f"  {Colors.BOLD}[9]{Colors.RESET} Удалить сохранённый прокси")
+            print(f"  {Colors.BOLD}[5]{Colors.RESET} Разблокировать вход в аккаунт из-под санкций (отдельно)")
+            print(f"  {Colors.BOLD}[6]{Colors.RESET} {Colors.YELLOW}Выключить всё{Colors.RESET} (Откат всех патчей + Остановка службы + Сброс)")
+            print(f"  {Colors.BOLD}[7]{Colors.RESET} Перезапустить локальную службу прокси")
+            print(f"  {Colors.BOLD}[8]{Colors.RESET} Остановить локальную службу прокси")
+            print(f"  {Colors.BOLD}[9]{Colors.RESET} Восстановить оригиналы всех файлов (полный откат)")
+            print(f"  {Colors.BOLD}[D]{Colors.RESET} Удалить сохранённый прокси")
             print(f"  {Colors.BOLD}[0]{Colors.RESET} Выход (служба продолжит работать в фоне)")
-            print(f"\n{Colors.CYAN}Выберите действие (0-9):{Colors.RESET} ", end="", flush=True)
+            print(f"\n{Colors.CYAN}Выберите действие (0-9, D):{Colors.RESET} ", end="", flush=True)
 
             try:
                 choice = input().strip()
@@ -927,6 +1153,7 @@ class UnlockerTUI:
                 print()
                 break
 
+            choice_lower = choice.lower()
             if choice == "1":
                 self.action_input_proxy()
             elif choice == "2":
@@ -936,16 +1163,18 @@ class UnlockerTUI:
             elif choice == "4":
                 self.action_launch_app()
             elif choice == "5":
-                self.action_disable_all()
+                self.action_patch_account()
             elif choice == "6":
-                self.action_start_proxy()
+                self.action_disable_all()
             elif choice == "7":
-                self.action_stop_proxy()
+                self.action_start_proxy()
             elif choice == "8":
-                self.action_unpatch_all()
+                self.action_stop_proxy()
             elif choice == "9":
+                self.action_unpatch_all()
+            elif choice_lower == "d":
                 clear_upstream()
-                self.message = "Прокси удалён."
+                self.message = "Прокси удалён"
                 self.message_color = Colors.YELLOW
             elif choice == "0":
                 break
@@ -1027,6 +1256,24 @@ class UnlockerTUI:
         self.message = "Локальный прокси остановлен"
         self.message_color = Colors.YELLOW
 
+    def action_patch_account(self):
+        installs = find_mac_antigravity_installs()
+        if not installs:
+            self.message = "Установка Antigravity не найдена в /Applications"
+            self.message_color = Colors.RED
+            return
+
+        kill_antigravity_processes()
+        res = patch_account_auth_all(installs)
+        success = sum(1 for _, ok, _ in res if ok)
+        total = len(res)
+        if total == 0:
+            self.message = "JS-файлы для патча аккаунта не найдены (в новых сборках может не требоваться)"
+            self.message_color = Colors.YELLOW
+        else:
+            self.message = f"Вход в аккаунт: пропатчено {success} из {total} JS-файлов"
+            self.message_color = Colors.GREEN if success == total else Colors.YELLOW
+
     def action_patch_all(self):
         installs = find_mac_antigravity_installs()
         if not installs:
@@ -1063,7 +1310,9 @@ class UnlockerTUI:
             if ok:
                 count += 1
 
-        self.message = f"Восстановлено {count} файлов"
+        count += unpatch_account_auth_all(installs)
+
+        self.message = f"Восстановлено {count} файлов (бинарники + JS)"
         self.message_color = Colors.GREEN
 
     def action_enable_all(self):
@@ -1077,17 +1326,20 @@ class UnlockerTUI:
         # 1. Завершаем старые запущенные процессы Antigravity
         kill_antigravity_processes()
 
-        # 2. Патчим бинарники
+        # 2. Патчим бинарники (ошибка 400)
         self.action_patch_all()
 
-        # 3. Запускаем службу прокси
+        # 3. Патчим JS (вход в аккаунт под санкциями)
+        patch_account_auth_all()
+
+        # 4. Запускаем службу прокси
         self.action_start_proxy()
 
-        # 4. Прописываем прокси в settings.json и launchctl
+        # 5. Прописываем прокси в settings.json и launchctl
         _, _, port = is_proxy_daemon_running()
         apply_mac_environment(port)
 
-        self.message = "«Включить всё» выполнено! Настройки прописаны в settings.json. Запустите Antigravity (пункт 4)."
+        self.message = "«Включить всё» выполнено! Пропатчены бинарники и вход в аккаунт. Запустите Antigravity (пункт 4)."
         self.message_color = Colors.GREEN
 
     def action_launch_app(self):
@@ -1154,6 +1406,17 @@ def main():
             for t in get_binary_targets(inst):
                 ok, msg = unpatch_binary_file(t)
                 print(f"Unpatch {t.name}: {msg}")
+        return
+
+    if "--patch-account" in sys.argv:
+        res = patch_account_auth_all()
+        for label, ok, msg in res:
+            print(f"Patch JS {label}: {msg}")
+        return
+
+    if "--unpatch-account" in sys.argv:
+        count = unpatch_account_auth_all()
+        print(f"Unpatched {count} JS files")
         return
 
     tui = UnlockerTUI()

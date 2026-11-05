@@ -13,6 +13,9 @@ from ag_unlocker import (
     patch_binary_file,
     unpatch_binary_file,
     inspect_binary,
+    patch_ide_main_js,
+    patch_extension_js,
+    patch_desktop_main_js,
     PATCH_INELIGIBLE_OLD,
     PATCH_INELIGIBLE_NEW,
     PATCH_TIERS_OLD,
@@ -122,6 +125,99 @@ class TestMacUnlocker(unittest.TestCase):
 
             reverted_data = tmp_path.read_bytes()
             self.assertEqual(reverted_data, dummy_content)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+            tmp_path.with_name(tmp_path.name + ".ag_backup").unlink(missing_ok=True)
+
+    def test_patch_ide_main_js(self):
+        sample_js = (
+            'console.log("start");\n'
+            'async signInHandler(token){'
+            'if(this.actor.send({type:token.isGcpTos?"GCP_SIGN_IN":"SIGN_IN"}),this.client.resetIsTierGCPTos(),this.client.isGoogleInternal){'
+            'try{await this.client.loadCodeAssist(token);'
+            'const{settings:setVar,userTier:tierVar}=await this.refreshUserStatus(token),infoVar=formatFunc(token);'
+            'this.updater.pushUpdate(infoVar),this.actor.send({type:"AUTH_SUCCESS",tokenInfo:token}),this.emitter.fire({settings:setVar,userTier:tierVar})'
+            '}catch(err){console.error(err);return;}}\n'
+            'console.log("end");'
+        )
+
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+            tmp_path = Path(f.name)
+            f.write(sample_js)
+
+        try:
+            ok, msg = patch_ide_main_js(tmp_path)
+            self.assertTrue(ok, f"Patch failed: {msg}")
+
+            patched_content = tmp_path.read_text(encoding="utf-8")
+            self.assertIn("/*[AG_IDE_PATCHED]*/", patched_content)
+            self.assertIn('"pro"', patched_content)
+            self.assertIn('onboardUser("standard-tier"', patched_content)
+
+            # Проверяем бэкап
+            bak_path = tmp_path.with_name(tmp_path.name + ".ag_backup")
+            self.assertTrue(bak_path.is_file())
+            self.assertEqual(bak_path.read_text(encoding="utf-8"), sample_js)
+
+            # Повторный вызов должен быть идемпотентным
+            ok2, msg2 = patch_ide_main_js(tmp_path)
+            self.assertTrue(ok2)
+            self.assertIn("Уже", msg2)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+            tmp_path.with_name(tmp_path.name + ".ag_backup").unlink(missing_ok=True)
+
+    def test_patch_extension_js(self):
+        sample_ext = (
+            'const t=await api.UserStatus.getUserStatus();if(!t)return[];'
+            'const n=(0,helper.format)(t,ctx),{email:userMail,name:userName}=n;'
+            'return""===userMail?[]:showUser();'
+        )
+
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+            tmp_path = Path(f.name)
+            f.write(sample_ext)
+
+        try:
+            ok, msg = patch_extension_js(tmp_path)
+            self.assertTrue(ok, f"Patch failed: {msg}")
+
+            patched = tmp_path.read_text(encoding="utf-8")
+            self.assertIn("/*[AG_EXT_PATCHED]*/", patched)
+            self.assertIn('userMail="antigravity-user"', patched)
+            self.assertIn('userName="User"', patched)
+
+            # Повторный вызов
+            ok2, _ = patch_extension_js(tmp_path)
+            self.assertTrue(ok2)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+            tmp_path.with_name(tmp_path.name + ".ag_backup").unlink(missing_ok=True)
+
+    def test_patch_desktop_main_js(self):
+        sample_desktop = (
+            'function test() {'
+            '_handleAuthErrorResponse(err){var det=err?.failureDetails;'
+            'if(other?.failureDetails?.case==="ineligible"?this._authActor.send({type:"SET_INELIGIBLE"}:false){}'
+            '}'
+        )
+
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+            tmp_path = Path(f.name)
+            f.write(sample_desktop)
+
+        try:
+            ok, msg = patch_desktop_main_js(tmp_path)
+            self.assertTrue(ok, f"Patch desktop failed: {msg}")
+
+            patched = tmp_path.read_text(encoding="utf-8")
+            self.assertIn('case==="ineligible"', patched)
+            self.assertIn('AUTH_SUCCESS', patched)
+            self.assertIn('NEVER_MATCH', patched)
+
+            # Повторный вызов
+            ok2, _ = patch_desktop_main_js(tmp_path)
+            self.assertTrue(ok2)
         finally:
             tmp_path.unlink(missing_ok=True)
             tmp_path.with_name(tmp_path.name + ".ag_backup").unlink(missing_ok=True)
